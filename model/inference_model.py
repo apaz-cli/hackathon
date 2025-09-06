@@ -3,6 +3,7 @@ from enum import Enum
 
 import torch
 import torch.nn as nn
+import triton.testing
 
 from .mamba2 import Mamba2
 from .retnet import RetNet
@@ -114,17 +115,53 @@ class MultiTowerModel(nn.Module):
         self.towers = nn.ModuleList(
             [Tower(config, layer_type) for layer_type in layer_types]
         )
+        self.layer_types = layer_types  # Store for profiling
         self.output_proj = nn.Linear(config.hidden_size, 1)
+        self.profile_enabled = False
+        self.last_tower_timings = None
+
+    def enable_profiling(self, enable: bool = True):
+        self.profile_enabled = enable
 
     def forward(self, x: torch.Tensor, state):
-        results = [
-            tower(x, tower_state)
-            for tower_state, tower in zip(state, self.towers, strict=True)
-        ]
-        xs, new_state = zip(*results, strict=True)
+        if self.profile_enabled:
+            # Profile each tower separately
+            results = []
+            tower_timings = []
+            
+            for i, (tower_state, tower) in enumerate(zip(state, self.towers, strict=True)):
+                tower_name = self.layer_types[i].value
+                
+                def tower_forward():
+                    return tower(x, tower_state)
+                
+                # Benchmark the tower
+                timing_ms = triton.testing.do_bench(tower_forward, warmup=10, rep=100)
+                tower_timings.append((tower_name, timing_ms))
+                
+                # Get the actual result
+                result = tower_forward()
+                results.append(result)
+            
+            # Store timing results instead of printing
+            self.last_tower_timings = dict(tower_timings)
+            
+            xs, new_state = zip(*results, strict=True)
+        else:
+            # Normal forward pass without profiling
+            results = [
+                tower(x, tower_state)
+                for tower_state, tower in zip(state, self.towers, strict=True)
+            ]
+            xs, new_state = zip(*results, strict=True)
+            self.last_tower_timings = None
 
         xs = [self.output_proj(x) for x in xs]
         return torch.concat(xs, dim=1), list(new_state)
+    
+    def get_last_tower_timings(self):
+        """Return the timing results from the last forward pass"""
+        return self.last_tower_timings
 
     def init_state(self, batch_size, device):
         return [tower.init_state(batch_size, device) for tower in self.towers]
